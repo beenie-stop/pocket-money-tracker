@@ -12,10 +12,66 @@ DEFAULT_SOURCES = ["Father", "Mother", "Relatives"]
 st.set_page_config(page_title="Pocket Money Tracker", page_icon="💸", layout="centered")
 database.init_db()
 
-st.title("💸 Pocket Money Tracker")
+# ---------------- Login / Signup ----------------
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+    st.session_state.username = None
+
+if st.session_state.user_id is None:
+    st.title("💸 Pocket Money Tracker")
+    tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Log in")
+            if submitted:
+                user_id = database.verify_user(username, password)
+                if user_id:
+                    st.session_state.user_id = user_id
+                    st.session_state.username = username.strip().lower()
+                    st.rerun()
+                else:
+                    st.error("Incorrect username or password.")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            new_username = st.text_input("Choose a username")
+            new_password = st.text_input("Choose a password", type="password")
+            confirm_password = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Create account")
+            if submitted:
+                if not new_username.strip() or not new_password:
+                    st.error("Please fill in both fields.")
+                elif new_password != confirm_password:
+                    st.error("Passwords don't match.")
+                else:
+                    success, msg = database.create_user(new_username, new_password)
+                    if success:
+                        st.success(msg + " You can log in now.")
+                    else:
+                        st.error(msg)
+
+    st.stop()  # nothing below runs until logged in
+
+# ---------------- Main app (only reached once logged in) ----------------
+
+user_id = st.session_state.user_id
+
+top_col1, top_col2 = st.columns([4, 1])
+with top_col1:
+    st.title("💸 Pocket Money Tracker")
+    st.caption(f"Logged in as **{st.session_state.username}**")
+with top_col2:
+    if st.button("Log out"):
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.rerun()
 
 # ---- Month selector ----
-months_available = database.get_available_months()
+months_available = database.get_available_months(user_id)
 current_month = date.today().strftime("%Y-%m")
 if current_month not in months_available:
     months_available = [current_month] + months_available
@@ -25,9 +81,9 @@ selected_month = st.selectbox(
     index=months_available.index(current_month) if current_month in months_available else 0
 )
 
-# ---- Money sources (Father / Mother / Relatives / custom) ----
+# ---- Money sources ----
 st.subheader("💰 Money received this month")
-sources = database.get_sources_by_month(selected_month)
+sources = database.get_sources_by_month(user_id, selected_month)
 source_amounts = {s["source"]: s["amount"] for s in sources}
 
 with st.expander("Add / update money received", expanded=(len(sources) == 0)):
@@ -37,7 +93,7 @@ with st.expander("Add / update money received", expanded=(len(sources) == 0)):
             value=float(source_amounts.get(name, 0.0)), key=f"src_{name}"
         )
         if st.button(f"Save {name}", key=f"save_{name}"):
-            database.set_source_amount(selected_month, name, amt)
+            database.set_source_amount(user_id, selected_month, name, amt)
             st.success(f"Saved {name}'s contribution!")
             st.rerun()
 
@@ -46,17 +102,16 @@ with st.expander("Add / update money received", expanded=(len(sources) == 0)):
     custom_amt = st.number_input("Amount", min_value=0.0, step=100.0, key="custom_source_amt")
     if st.button("Add this source"):
         if custom_name.strip() and custom_amt > 0:
-            database.set_source_amount(selected_month, custom_name.strip(), custom_amt)
+            database.set_source_amount(user_id, selected_month, custom_name.strip(), custom_amt)
             st.success(f"Added {custom_name}!")
             st.rerun()
         else:
             st.error("Enter a name and amount.")
 
-sources = database.get_sources_by_month(selected_month)
+sources = database.get_sources_by_month(user_id, selected_month)
 total_budget = sum(s["amount"] for s in sources)
 
-# ---- Spending per source so far this month ----
-data = database.get_transactions_by_month(selected_month)
+data = database.get_transactions_by_month(user_id, selected_month)
 df_all = pd.DataFrame(data) if data else pd.DataFrame(columns=["type", "category", "amount", "note", "date", "source"])
 
 spent_by_source = {}
@@ -102,14 +157,14 @@ with st.form("add_form", clear_on_submit=True):
             st.error("Please choose a category and enter a valid amount.")
         else:
             database.add_transaction(
-                t_type, final_category, amount, note, str(txn_date), spend_source
+                user_id, t_type, final_category, amount, note, str(txn_date), spend_source
             )
             st.success("Added!")
             st.rerun()
 
 st.divider()
 
-# ---- Overview for the month ----
+# ---- Overview ----
 if df_all.empty:
     st.info("No transactions for this month yet.")
 else:
@@ -170,5 +225,5 @@ else:
                 st.markdown(f":{color}[{sign}₹{row['amount']:,.0f}]  \n{row['note'] or ''}")
             with col2:
                 if st.button("Delete", key=f"del_{row['id']}"):
-                    database.delete_transaction(row['id'])
+                    database.delete_transaction(user_id, row['id'])
                     st.rerun()
