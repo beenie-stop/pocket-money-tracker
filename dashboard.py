@@ -6,45 +6,18 @@ from fpdf import FPDF
 import io
 import database
 
+
 CATEGORIES = ["Food", "Cab/Transport", "Groceries", "Rent", "Subscriptions",
               "Entertainment", "Shopping", "Health", "Education", "Miscellaneous", "Other"]
 
 DEFAULT_SOURCES = ["Father", "Mother", "Relatives"]
 
-CATEGORY_COLORS = {
-    "Food": "#FF6B6B", "Cab/Transport": "#4ECDC4", "Groceries": "#FFD93D",
-    "Rent": "#6C5CE7", "Subscriptions": "#A29BFE", "Entertainment": "#FD79A8",
-    "Shopping": "#FDCB6E", "Health": "#00B894", "Education": "#0984E3",
-    "Miscellaneous": "#B2BEC3", "Other": "#636E72"
-}
+
 
 st.set_page_config(page_title="Pocket Money Tracker", page_icon="💸", layout="centered")
 database.init_db()
 
-# ---------------- Custom styling ----------------
-st.markdown("""
-<style>
-    .stApp { background: linear-gradient(180deg, #0f0c29 0%, #1a1a2e 100%); }
-    h1 { background: linear-gradient(90deg, #FF6B6B, #FFD93D, #4ECDC4);
-         -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-         font-weight: 800; }
-    div[data-testid="stMetric"] {
-        background: rgba(255,255,255,0.05); border-radius: 14px; padding: 14px;
-        border: 1px solid rgba(255,255,255,0.08);
-    }
-    .stButton>button {
-        border-radius: 10px; font-weight: 600;
-    }
-    div[data-testid="stForm"] {
-        background: rgba(255,255,255,0.03); border-radius: 16px; padding: 18px;
-        border: 1px solid rgba(255,255,255,0.06);
-    }
-    .txn-card {
-        border-radius: 14px; padding: 12px 16px; margin-bottom: 8px;
-        background: rgba(255,255,255,0.04); border-left: 5px solid var(--accent);
-    }
-</style>
-""", unsafe_allow_html=True)
+
 
 # ---------------- Login / Signup ----------------
 

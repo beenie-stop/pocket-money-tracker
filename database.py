@@ -5,6 +5,7 @@ import hashlib
 import secrets as pysecrets
 from datetime import date
 
+
 def get_connection():
     return psycopg2.connect(st.secrets["DATABASE_URL"])
 
@@ -42,6 +43,7 @@ def init_db():
                         PRIMARY KEY (user_id, month, source)
                     )
                 """)
+               
     finally:
         conn.close()
 
@@ -182,5 +184,61 @@ def get_sources_by_month(user_id, month):
                 (user_id, month)
             )
             return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+
+def create_session_table_if_needed():
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        token TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        expires_at TIMESTAMP NOT NULL
+                    )
+                """)
+    finally:
+        conn.close()
+
+def create_session(user_id, days_valid=30):
+    token = pysecrets2.token_hex(32)
+    expires_at = datetime.utcnow() + timedelta(days=days_valid)
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sessions (token, user_id, expires_at) VALUES (%s, %s, %s)",
+                    (token, user_id, expires_at)
+                )
+    finally:
+        conn.close()
+    return token
+
+def get_user_id_from_token(token):
+    if not token:
+        return None
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM sessions WHERE token = %s AND expires_at > %s",
+                (token, datetime.utcnow())
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
+
+def delete_session(token):
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
     finally:
         conn.close()
