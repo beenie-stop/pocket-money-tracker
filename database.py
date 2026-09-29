@@ -103,6 +103,19 @@ def add_transaction(user_id, t_type, category, amount, note="", txn_date=None, s
     finally:
         conn.close()
 
+def update_transaction(user_id, transaction_id, t_type, category, amount, note, txn_date, source):
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE transactions SET type=%s, category=%s, amount=%s, note=%s, date=%s, source=%s "
+                    "WHERE id=%s AND user_id=%s",
+                    (t_type, category, amount, note, txn_date, source, transaction_id, user_id)
+                )
+    finally:
+        conn.close()        
+
 def get_transactions_by_month(user_id, month):
     conn = get_connection()
     try:
