@@ -1,10 +1,9 @@
-
 import streamlit as st
 import psycopg2
 import psycopg2.extras
 import hashlib
 import secrets as pysecrets
-from datetime import date
+from datetime import date, datetime, timedelta
 
 
 def get_connection():
@@ -53,6 +52,14 @@ def init_db():
                         source TEXT NOT NULL,
                         amount REAL NOT NULL,
                         PRIMARY KEY (user_id, month, source)
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        token TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        expires_at TIMESTAMP NOT NULL
                     )
                 """)
 
@@ -113,6 +120,17 @@ def verify_user(username, password):
 
             return None
 
+    finally:
+        conn.close()
+
+
+def get_username_by_id(user_id):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
     finally:
         conn.close()
 
@@ -331,28 +349,10 @@ def get_sources_by_month(user_id, month):
         conn.close()
 
 
-# ---------- Sessions ----------
-
-def create_session_table_if_needed():
-    conn = get_connection()
-
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        token TEXT PRIMARY KEY,
-                        user_id INTEGER NOT NULL,
-                        expires_at TIMESTAMP NOT NULL
-                    )
-                """)
-
-    finally:
-        conn.close()
-
+# ---------- Sessions (for "keep me logged in") ----------
 
 def create_session(user_id, days_valid=30):
-    token = pysecrets2.token_hex(32)
+    token = pysecrets.token_hex(32)
     expires_at = datetime.utcnow() + timedelta(days=days_valid)
 
     conn = get_connection()
