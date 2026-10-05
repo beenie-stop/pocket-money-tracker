@@ -475,7 +475,25 @@ def delete_transaction(user_id, transaction_id):
 
 # ---------- Money sources ----------
 
+def _resolve_source_name(cur, user_id, month, source):
+    """Return the stored spelling of a source if it already exists for this
+    month (case-insensitive), otherwise the cleaned name."""
+    cur.execute(
+        """
+        SELECT source
+        FROM money_sources
+        WHERE user_id = %s
+          AND month = %s
+          AND LOWER(source) = LOWER(%s)
+        """,
+        (user_id, month, source)
+    )
+    row = cur.fetchone()
+    return row[0] if row else source
+
+
 def set_source_amount(user_id, month, source, amount):
+    """Set a source to an exact amount (replaces the old value)."""
     source = (source or "").strip()
     if not source:
         raise ValueError("Source name cannot be empty.")
@@ -486,6 +504,7 @@ def set_source_amount(user_id, month, source, amount):
     try:
         with conn:
             with conn.cursor() as cur:
+                source = _resolve_source_name(cur, user_id, month, source)
                 cur.execute(
                     """
                     INSERT INTO money_sources
@@ -495,6 +514,70 @@ def set_source_amount(user_id, month, source, amount):
                     DO UPDATE SET amount = EXCLUDED.amount
                     """,
                     (user_id, month, source, amount)
+                )
+    finally:
+        conn.close()
+
+
+def add_to_source_amount(user_id, month, source, amount):
+    """Add money to a source. If the source already exists the amount is
+    ADDED to the current value instead of replacing it."""
+    source = (source or "").strip()
+    if not source:
+        raise ValueError("Source name cannot be empty.")
+
+    amount = _to_money(amount)
+    if amount <= 0:
+        raise ValueError("Amount must be greater than zero.")
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                source = _resolve_source_name(cur, user_id, month, source)
+                cur.execute(
+                    """
+                    INSERT INTO money_sources
+                    (user_id, month, source, amount)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, month, source)
+                    DO UPDATE SET amount = money_sources.amount + EXCLUDED.amount
+                    """,
+                    (user_id, month, source, amount)
+                )
+    finally:
+        conn.close()
+
+
+def delete_source(user_id, month, source):
+    """Remove a source. Refused if expenses were already made from it."""
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM transactions
+                    WHERE user_id = %s
+                      AND type = 'expense'
+                      AND source = %s
+                      AND date LIKE %s
+                    """,
+                    (user_id, source, f"{month}%")
+                )
+                if cur.fetchone()[0] > 0:
+                    raise ValueError(
+                        f"{source} has expenses this month, so it can't be "
+                        "removed. Edit or delete those expenses first."
+                    )
+
+                cur.execute(
+                    """
+                    DELETE FROM money_sources
+                    WHERE user_id = %s AND month = %s AND source = %s
+                    """,
+                    (user_id, month, source)
                 )
     finally:
         conn.close()

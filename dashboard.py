@@ -154,20 +154,36 @@ source_amounts = {
     for s in sources
 }
 
+if "src_form_n" not in st.session_state:
+    st.session_state.src_form_n = 0
+form_n = st.session_state.src_form_n
+
+# Default sources + any custom source already saved this month
+editable_sources = DEFAULT_SOURCES + [
+    name for name in source_amounts if name not in DEFAULT_SOURCES
+]
+
 with st.expander(
     "Add / update money received",
     expanded=(len(sources) == 0)
 ):
-    for name in DEFAULT_SOURCES:
+    st.markdown("**Edit a source** (sets the exact total received)")
+
+    for name in editable_sources:
+        current = float(source_amounts.get(name, 0))
+
+        # Key includes the saved amount so the box refreshes after changes.
         amt = st.number_input(
             name,
             min_value=0.0,
             step=100.0,
-            value=float(source_amounts.get(name, 0)),
-            key=f"src_{name}"
+            value=current,
+            key=f"src_{name}_{current}"
         )
 
-        if st.button(f"Save {name}", key=f"save_{name}"):
+        save_col, del_col = st.columns(2)
+
+        if save_col.button(f"Save {name}", key=f"save_{name}"):
             try:
                 database.set_source_amount(
                     user_id,
@@ -175,39 +191,60 @@ with st.expander(
                     name,
                     amt
                 )
-                st.success(f"Saved {name}'s contribution!")
+                st.success(f"Saved {name}: ₹{amt:,.0f}")
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
 
-    st.markdown("**Someone else?**")
+        if name in source_amounts:
+            if del_col.button(f"Remove {name}", key=f"del_{name}"):
+                try:
+                    database.delete_source(
+                        user_id,
+                        selected_month,
+                        name
+                    )
+                    st.success(f"Removed {name}.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+    st.divider()
+    st.markdown("**Add more money**")
+    st.caption(
+        "If the name already exists (e.g. Savings), this amount is "
+        "ADDED to what it already has. Nothing is overwritten."
+    )
 
     custom_name = st.text_input(
-        "Name (e.g. Uncle, Grandma)",
-        key="custom_source_name"
+        "Name (e.g. Savings, Uncle, Grandma)",
+        key=f"custom_source_name_{form_n}"
     )
     custom_amt = st.number_input(
-        "Amount",
+        "Amount to add",
         min_value=0.0,
         step=100.0,
-        key="custom_source_amt"
+        key=f"custom_source_amt_{form_n}"
     )
 
-    if st.button("Add this source"):
+    if st.button("Add this amount"):
         if custom_name.strip() and custom_amt > 0:
             try:
-                database.set_source_amount(
+                database.add_to_source_amount(
                     user_id,
                     selected_month,
                     custom_name.strip(),
                     custom_amt
                 )
-                st.success(f"Added {custom_name.strip()}!")
+                st.session_state.src_form_n += 1
+                st.success(
+                    f"Added ₹{custom_amt:,.0f} to {custom_name.strip()}!"
+                )
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
         else:
-            st.error("Enter a name and amount.")
+            st.error("Enter a name and an amount above 0.")
 
 
 sources = database.get_sources_by_month(
@@ -267,6 +304,7 @@ if sources:
     st.write("**Balance by source:**")
 
     cols = st.columns(len(sources))
+    overspent = []
 
     for i, source_row in enumerate(sources):
         remaining = (
@@ -280,6 +318,17 @@ if sources:
             help=(
                 f"of ₹{source_row['amount']:,.0f} received"
             )
+        )
+
+        if remaining < 0:
+            overspent.append(source_row["source"])
+
+    if overspent:
+        st.warning(
+            "Spent more than received from: "
+            + ", ".join(overspent)
+            + ". If you added money recently, use \"Add more money\" "
+            "above or edit the amount."
         )
 else:
     st.info(
