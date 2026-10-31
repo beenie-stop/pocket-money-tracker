@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 from datetime import date
+from decimal import Decimal
 from fpdf import FPDF
 from streamlit_cookies_controller import CookieController
 import database
@@ -14,6 +15,8 @@ CATEGORIES = [
 ]
 DEFAULT_SOURCES = ["Father", "Mother", "Relatives"]
 PAYMENT_METHODS = ["UPI", "Cash"]
+PAGE_SIZE = 30  # transactions rendered at a time
+
 
 st.set_page_config(
     page_title="Pocket Money Tracker",
@@ -21,8 +24,101 @@ st.set_page_config(
     layout="centered"
 )
 
+# Cached: the schema is created/upgraded once per server process,
+# not on every click.
 database.init_db()
 cookies = CookieController()
+
+
+# ---------------- Helpers ----------------
+def inr(value):
+    """Format money as ₹. Shows paise only when there are some, so a
+    ₹250.50 expense is never displayed as ₹250."""
+    value = Decimal(str(value))
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+
+    if value == value.to_integral_value():
+        return f"{sign}₹{value:,.0f}"
+    return f"{sign}₹{value:,.2f}"
+
+
+def payment_format(method):
+    return "📱 UPI" if method == "UPI" else "💵 Cash"
+
+
+def pdf_safe(value):
+    """FPDF's built-in Helvetica uses Latin-1. Replace unsupported Unicode
+    characters instead of letting PDF generation crash."""
+    return str(value).encode("latin-1", errors="replace").decode("latin-1")
+
+
+def generate_pdf(export_df, month, username):
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(
+        0, 10, pdf_safe(f"Pocket Money Report - {month}"),
+        new_x="LMARGIN", new_y="NEXT"
+    )
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(
+        0, 8, pdf_safe(f"User: {username}"),
+        new_x="LMARGIN", new_y="NEXT"
+    )
+    pdf.ln(4)
+
+    headers = ["Date", "Category", "Amount", "Payment", "Note", "Source"]
+    col_widths = [28, 38, 30, 30, 100, 38]
+
+    def draw_header():
+        pdf.set_font("Helvetica", "B", 9)
+        for width, header in zip(col_widths, headers):
+            pdf.cell(width, 8, header, border=1)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 8)
+
+    draw_header()
+
+    for _, row in export_df.iterrows():
+        if pdf.get_y() > 185:
+            pdf.add_page()
+            draw_header()
+
+        txn_date = row["date"]
+        if pd.notna(txn_date):
+            date_text = (
+                txn_date.strftime("%Y-%m-%d")
+                if hasattr(txn_date, "strftime")
+                else str(txn_date)
+            )
+        else:
+            date_text = "-"
+
+        sign = "+" if row["type"] == "income" else "-"
+        payment = (
+            str(row.get("payment_method", "Cash"))
+            if row["type"] == "expense"
+            else "N/A"
+        )
+
+        values = [
+            date_text,
+            str(row["category"])[:25],
+            f"{sign}Rs {float(row['amount']):.2f}",
+            payment,
+            str(row["note"] or "")[:60],
+            str(row["source"] or "-")[:25]
+        ]
+
+        for width, value in zip(col_widths, values):
+            pdf.cell(width, 8, pdf_safe(value), border=1)
+        pdf.ln()
+
+    return bytes(pdf.output())
 
 
 # ---------------- Session state + auto-login ----------------
@@ -76,10 +172,7 @@ if st.session_state.user_id is None:
     with tab_signup:
         with st.form("signup_form"):
             new_username = st.text_input("Choose a username")
-            new_password = st.text_input(
-                "Choose a password",
-                type="password"
-            )
+            new_password = st.text_input("Choose a password", type="password")
             confirm_password = st.text_input(
                 "Confirm password",
                 type="password"
@@ -110,9 +203,7 @@ top_col1, top_col2 = st.columns([4, 1])
 
 with top_col1:
     st.title("💸 Pocket Money Tracker")
-    st.caption(
-        f"Logged in as **{st.session_state.username}**"
-    )
+    st.caption(f"Logged in as **{st.session_state.username}**")
 
 with top_col2:
     if st.button("Log out"):
@@ -124,6 +215,9 @@ with top_col2:
         st.session_state.user_id = None
         st.session_state.username = None
         st.session_state.editing_id = None
+        # Don't carry one user's month/paging state over to the next login.
+        for key in ("selected_month", "txn_month", "txn_limit", "pdf_report"):
+            st.session_state.pop(key, None)
         st.rerun()
 
 
@@ -134,25 +228,30 @@ current_month = date.today().strftime("%Y-%m")
 if current_month not in months_available:
     months_available = [current_month] + months_available
 
+# The key keeps the chosen month stable. Without it the list of months
+# changes after adding data for a new month and the selector jumped back
+# to the current month.
 selected_month = st.selectbox(
     "Month",
     months_available,
-    index=months_available.index(current_month)
-    if current_month in months_available else 0
+    index=months_available.index(current_month),
+    key="selected_month"
 )
+
+# New month -> start paging from the top and leave edit mode.
+if st.session_state.get("txn_month") != selected_month:
+    st.session_state.txn_month = selected_month
+    st.session_state.txn_limit = PAGE_SIZE
+    st.session_state.editing_id = None
 
 
 # ---------------- Money received ----------------
 st.subheader("💰 Money received this month")
 
-sources = database.get_sources_by_month(
-    user_id,
-    selected_month
-)
-source_amounts = {
-    s["source"]: s["amount"]
-    for s in sources
-}
+# Fetched once per run (cached). Every change below ends in st.rerun(),
+# so there is no need to fetch it a second time.
+sources = database.get_sources_by_month(user_id, selected_month)
+source_amounts = {s["source"]: s["amount"] for s in sources}
 
 if "src_form_n" not in st.session_state:
     st.session_state.src_form_n = 0
@@ -183,7 +282,7 @@ with st.expander(
 
         save_col, del_col = st.columns(2)
 
-        if save_col.button(f"Save {name}", key=f"save_{name}"):
+        if save_col.button(f"Save {name}", key=f"src_save_{name}"):
             try:
                 database.set_source_amount(
                     user_id,
@@ -191,20 +290,20 @@ with st.expander(
                     name,
                     amt
                 )
-                st.success(f"Saved {name}: ₹{amt:,.0f}")
+                st.toast(f"Saved {name}: {inr(amt)}")
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
 
         if name in source_amounts:
-            if del_col.button(f"Remove {name}", key=f"del_{name}"):
+            if del_col.button(f"Remove {name}", key=f"src_del_{name}"):
                 try:
                     database.delete_source(
                         user_id,
                         selected_month,
                         name
                     )
-                    st.success(f"Removed {name}.")
+                    st.toast(f"Removed {name}.")
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
@@ -237,8 +336,8 @@ with st.expander(
                     custom_amt
                 )
                 st.session_state.src_form_n += 1
-                st.success(
-                    f"Added ₹{custom_amt:,.0f} to {custom_name.strip()}!"
+                st.toast(
+                    f"Added {inr(custom_amt)} to {custom_name.strip()}!"
                 )
                 st.rerun()
             except ValueError as exc:
@@ -247,21 +346,11 @@ with st.expander(
             st.error("Enter a name and an amount above 0.")
 
 
-sources = database.get_sources_by_month(
-    user_id,
-    selected_month
-)
-total_budget = sum(
-    (s["amount"] for s in sources),
-    0
-)
+total_budget = sum((s["amount"] for s in sources), Decimal(0))
 
 
 # ---------------- Load transactions ----------------
-data = database.get_transactions_by_month(
-    user_id,
-    selected_month
-)
+data = database.get_transactions_by_month(user_id, selected_month)
 
 df_all = (
     pd.DataFrame(data)
@@ -288,9 +377,7 @@ else:
 spent_by_source = {}
 
 if not df_all.empty:
-    expense_df_all = df_all[
-        df_all["type"] == "expense"
-    ]
+    expense_df_all = df_all[df_all["type"] == "expense"]
 
     if not expense_df_all.empty:
         spent_by_source = (
@@ -303,7 +390,8 @@ if not df_all.empty:
 if sources:
     st.write("**Balance by source:**")
 
-    cols = st.columns(len(sources))
+    # At most 4 per row so many sources don't get squeezed.
+    cols = st.columns(min(len(sources), 4))
     overspent = []
 
     for i, source_row in enumerate(sources):
@@ -312,12 +400,10 @@ if sources:
             - spent_by_source.get(source_row["source"], 0)
         )
 
-        cols[i].metric(
+        cols[i % len(cols)].metric(
             source_row["source"],
-            f"₹{remaining:,.0f}",
-            help=(
-                f"of ₹{source_row['amount']:,.0f} received"
-            )
+            inr(remaining),
+            help=f"of {inr(source_row['amount'])} received"
         )
 
         if remaining < 0:
@@ -340,7 +426,7 @@ st.divider()
 
 
 # ---------------- Add transaction ----------------
-st.subheader("➕ Add an expense")
+st.subheader("➕ Add a transaction")
 
 source_names = (
     [s["source"] for s in sources]
@@ -348,21 +434,17 @@ source_names = (
     else DEFAULT_SOURCES
 )
 
-with st.form("add_form", clear_on_submit=True):
-    t_type = st.selectbox(
-        "Type",
-        ["expense", "income"]
-    )
+# Type and Category live OUTSIDE the form on purpose. Widgets inside st.form
+# don't trigger a rerun, so the "Specify category" box (for "Other") and the
+# expense-only fields below would not appear/disappear when these change.
+t_type = st.selectbox("Type", ["expense", "income"], key="add_type")
+category = st.selectbox("Category", CATEGORIES, key="add_category")
 
+with st.form("add_form", clear_on_submit=True):
     spend_source = (
         st.selectbox("Spend from", source_names)
         if t_type == "expense"
         else None
-    )
-
-    category = st.selectbox(
-        "Category",
-        CATEGORIES
     )
 
     custom_category = (
@@ -371,35 +453,21 @@ with st.form("add_form", clear_on_submit=True):
         else ""
     )
 
-    payment_method = None
-
-    if t_type == "expense":
-        payment_method = st.selectbox(
+    payment_method = (
+        st.selectbox(
             "Payment Method",
             PAYMENT_METHODS,
-            format_func=lambda x:
-                "📱 UPI" if x == "UPI" else "💵 Cash"
+            format_func=payment_format
         )
-
-    amount = st.number_input(
-        "Amount (₹)",
-        min_value=0.0,
-        step=10.0
+        if t_type == "expense"
+        else None
     )
 
-    note = st.text_input(
-        "Note (optional)"
-    )
+    amount = st.number_input("Amount (₹)", min_value=0.0, step=10.0)
+    note = st.text_input("Note (optional)")
+    txn_date = st.date_input("Date", value=date.today())
 
-    txn_date = st.date_input(
-        "Date",
-        value=date.today()
-    )
-
-    if st.form_submit_button(
-        "Add",
-        use_container_width=True
-    ):
+    if st.form_submit_button("Add", width="stretch"):
         final_category = (
             custom_category.strip()
             if category == "Other"
@@ -407,9 +475,7 @@ with st.form("add_form", clear_on_submit=True):
         )
 
         if not final_category or amount <= 0:
-            st.error(
-                "Please choose a category and enter a valid amount."
-            )
+            st.error("Please choose a category and enter a valid amount.")
         else:
             try:
                 database.add_transaction(
@@ -422,7 +488,7 @@ with st.form("add_form", clear_on_submit=True):
                     spend_source,
                     payment_method
                 )
-                st.success("Added!")
+                st.toast("Added!")
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
@@ -436,44 +502,20 @@ if df_all.empty:
     st.info("No transactions for this month yet.")
 else:
     df = df_all.copy()
-    df["date"] = pd.to_datetime(
-        df["date"],
-        errors="coerce"
-    )
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
     # Ignore malformed dates instead of crashing the whole dashboard.
     df = df.dropna(subset=["date"])
 
-    spent = df.loc[
-        df["type"] == "expense",
-        "amount"
-    ].sum()
-
-    extra_income = df.loc[
-        df["type"] == "income",
-        "amount"
-    ].sum()
-
-    remaining = (
-        total_budget
-        + extra_income
-        - spent
-    )
+    spent = df.loc[df["type"] == "expense", "amount"].sum()
+    extra_income = df.loc[df["type"] == "income", "amount"].sum()
+    remaining = total_budget + extra_income - spent
 
     c1, c2, c3 = st.columns(3)
 
-    c1.metric(
-        "Total Received",
-        f"₹{total_budget:,.0f}"
-    )
-    c2.metric(
-        "Spent",
-        f"₹{spent:,.0f}"
-    )
-    c3.metric(
-        "Remaining",
-        f"₹{remaining:,.0f}"
-    )
+    c1.metric("Total Received", inr(total_budget))
+    c2.metric("Spent", inr(spent))
+    c3.metric("Remaining", inr(remaining))
 
     if total_budget > 0:
         st.progress(
@@ -484,9 +526,7 @@ else:
             )
         )
 
-    expense_df = df[
-        df["type"] == "expense"
-    ].copy()
+    expense_df = df[df["type"] == "expense"].copy()
 
     expense_df["payment_method"] = (
         expense_df["payment_method"]
@@ -501,31 +541,20 @@ else:
 
     if not expense_df.empty:
         upi_spent = expense_df.loc[
-            expense_df["payment_method"] == "UPI",
-            "amount"
+            expense_df["payment_method"] == "UPI", "amount"
         ].sum()
 
         cash_spent = expense_df.loc[
-            expense_df["payment_method"] == "Cash",
-            "amount"
+            expense_df["payment_method"] == "Cash", "amount"
         ].sum()
 
         payment_total = upi_spent + cash_spent
 
         pm1, pm2, pm3 = st.columns(3)
 
-        pm1.metric(
-            "📱 UPI Spent",
-            f"₹{upi_spent:,.0f}"
-        )
-        pm2.metric(
-            "💵 Cash Spent",
-            f"₹{cash_spent:,.0f}"
-        )
-        pm3.metric(
-            "Total Expense",
-            f"₹{payment_total:,.0f}"
-        )
+        pm1.metric("📱 UPI Spent", inr(upi_spent))
+        pm2.metric("💵 Cash Spent", inr(cash_spent))
+        pm3.metric("Total Expense", inr(payment_total))
 
         upi_pct = (
             round(float(upi_spent / payment_total * 100), 1)
@@ -550,22 +579,13 @@ else:
                 theta="Amount:Q",
                 color=alt.Color(
                     "Payment Method:N",
-                    legend=alt.Legend(
-                        title="Payment Method"
-                    )
+                    legend=alt.Legend(title="Payment Method")
                 ),
-                tooltip=[
-                    "Payment Method",
-                    "Amount",
-                    "Percentage"
-                ]
+                tooltip=["Payment Method", "Amount", "Percentage"]
             )
         )
 
-        st.altair_chart(
-            payment_chart,
-            use_container_width=True
-        )
+        st.altair_chart(payment_chart, width="stretch")
 
         st.dataframe(
             payment_summary.rename(
@@ -575,12 +595,10 @@ else:
                 }
             ),
             hide_index=True,
-            use_container_width=True
+            width="stretch"
         )
 
-        st.subheader(
-            "📋 Detailed spending by payment method"
-        )
+        st.subheader("📋 Detailed spending by payment method")
 
         detail_col1, detail_col2 = st.columns(2)
 
@@ -589,13 +607,9 @@ else:
             (detail_col2, "Cash", "💵")
         ]:
             with col:
-                st.markdown(
-                    f"### {emoji} {method} Spending"
-                )
+                st.markdown(f"### {emoji} {method} Spending")
 
-                pm_df = expense_df[
-                    expense_df["payment_method"] == method
-                ]
+                pm_df = expense_df[expense_df["payment_method"] == method]
 
                 if not pm_df.empty:
                     pm_cat = (
@@ -603,18 +617,13 @@ else:
                         .groupby("category")["amount"]
                         .sum()
                         .reset_index()
-                        .sort_values(
-                            "amount",
-                            ascending=False
-                        )
+                        .sort_values("amount", ascending=False)
                     )
 
                     pm_total = pm_cat["amount"].sum()
 
                     pm_cat["percent"] = (
-                        pm_cat["amount"]
-                        / pm_total
-                        * 100
+                        pm_cat["amount"] / pm_total * 100
                     ).round(1)
 
                     st.dataframe(
@@ -626,17 +635,15 @@ else:
                             }
                         ),
                         hide_index=True,
-                        use_container_width=True
+                        width="stretch"
                     )
 
                     st.caption(
                         f"Total spent through {method}: "
-                        f"₹{pm_df['amount'].sum():,.0f}"
+                        f"{inr(pm_df['amount'].sum())}"
                     )
                 else:
-                    st.info(
-                        f"No {method} expenses recorded."
-                    )
+                    st.info(f"No {method} expenses recorded.")
 
 
         # ---------------- Spending by category ----------------
@@ -654,9 +661,7 @@ else:
 
         if cat_total > 0:
             cat_summary["percent"] = (
-                cat_summary["amount"]
-                / cat_total
-                * 100
+                cat_summary["amount"] / cat_total * 100
             ).round(1)
 
             pie = (
@@ -666,29 +671,17 @@ else:
                     theta="amount:Q",
                     color=alt.Color(
                         "category:N",
-                        legend=alt.Legend(
-                            title="Category"
-                        )
+                        legend=alt.Legend(title="Category")
                     ),
-                    tooltip=[
-                        "category",
-                        "amount",
-                        "percent"
-                    ]
+                    tooltip=["category", "amount", "percent"]
                 )
             )
 
-            st.altair_chart(
-                pie,
-                use_container_width=True
-            )
+            st.altair_chart(pie, width="stretch")
 
             st.dataframe(
                 cat_summary
-                .sort_values(
-                    "amount",
-                    ascending=False
-                )
+                .sort_values("amount", ascending=False)
                 .rename(
                     columns={
                         "category": "Category",
@@ -697,7 +690,7 @@ else:
                     }
                 ),
                 hide_index=True,
-                use_container_width=True
+                width="stretch"
             )
 
 
@@ -712,36 +705,21 @@ else:
             .to_dict()
         )
 
-        source_budget_map = {
-            s["source"]: s["amount"]
-            for s in sources
-        }
+        source_budget_map = {s["source"]: s["amount"] for s in sources}
 
         all_source_names = sorted(
-            set(
-                list(source_budget_map.keys())
-                + list(src_spent.keys())
-            )
+            set(list(source_budget_map.keys()) + list(src_spent.keys()))
         )
 
         src_rows = []
 
         for source_name in all_source_names:
-            received = source_budget_map.get(
-                source_name,
-                0
-            )
-            spent_amt = src_spent.get(
-                source_name,
-                0
-            )
+            received = source_budget_map.get(source_name, 0)
+            spent_amt = src_spent.get(source_name, 0)
             left = received - spent_amt
 
             pct_used = (
-                round(
-                    float(spent_amt / received * 100),
-                    1
-                )
+                round(float(spent_amt / received * 100), 1)
                 if received > 0
                 else 0
             )
@@ -757,27 +735,16 @@ else:
         if src_rows:
             src_summary = (
                 pd.DataFrame(src_rows)
-                .sort_values(
-                    "Spent (₹)",
-                    ascending=False
-                )
+                .sort_values("Spent (₹)", ascending=False)
             )
 
-            src_cols = st.columns(
-                min(len(src_summary), 4)
-            )
+            src_cols = st.columns(min(len(src_summary), 4))
 
-            for i, (_, row) in enumerate(
-                src_summary.iterrows()
-            ):
-                src_cols[
-                    i % len(src_cols)
-                ].metric(
+            for i, (_, row) in enumerate(src_summary.iterrows()):
+                src_cols[i % len(src_cols)].metric(
                     row["Source"],
-                    f"₹{row['Remaining (₹)']:,.0f} left",
-                    delta=(
-                        f"-₹{row['Spent (₹)']:,.0f} spent"
-                    ),
+                    f"{inr(row['Remaining (₹)'])} left",
+                    delta=f"-{inr(row['Spent (₹)'])} spent",
                     delta_color="inverse"
                 )
 
@@ -789,9 +756,7 @@ else:
                         theta="Spent (₹):Q",
                         color=alt.Color(
                             "Source:N",
-                            legend=alt.Legend(
-                                title="Source"
-                            )
+                            legend=alt.Legend(title="Source")
                         ),
                         tooltip=[
                             "Source",
@@ -802,20 +767,11 @@ else:
                     )
                 )
 
-                st.altair_chart(
-                    src_pie,
-                    use_container_width=True
-                )
+                st.altair_chart(src_pie, width="stretch")
 
-            st.dataframe(
-                src_summary,
-                hide_index=True,
-                use_container_width=True
-            )
+            st.dataframe(src_summary, hide_index=True, width="stretch")
 
-            with st.expander(
-                "See category breakdown per source"
-            ):
+            with st.expander("See category breakdown per source"):
                 for source_name in src_summary["Source"]:
                     source_df = expense_df[
                         expense_df["source"] == source_name
@@ -824,27 +780,20 @@ else:
                     if source_df.empty:
                         continue
 
-                    st.markdown(
-                        f"**{source_name}**"
-                    )
+                    st.markdown(f"**{source_name}**")
 
                     source_cat = (
                         source_df
                         .groupby("category")["amount"]
                         .sum()
                         .reset_index()
-                        .sort_values(
-                            "amount",
-                            ascending=False
-                        )
+                        .sort_values("amount", ascending=False)
                     )
 
                     source_total = source_cat["amount"].sum()
 
                     source_cat["percent"] = (
-                        source_cat["amount"]
-                        / source_total
-                        * 100
+                        source_cat["amount"] / source_total * 100
                     ).round(1)
 
                     st.dataframe(
@@ -856,7 +805,7 @@ else:
                             }
                         ),
                         hide_index=True,
-                        use_container_width=True
+                        width="stretch"
                     )
 
 
@@ -868,11 +817,7 @@ else:
     with f1:
         filter_categories = st.multiselect(
             "Category",
-            options=sorted(
-                df["category"]
-                .dropna()
-                .unique()
-            )
+            options=sorted(df["category"].dropna().unique())
         )
 
         filter_type = st.multiselect(
@@ -883,79 +828,48 @@ else:
     with f2:
         filter_source = st.multiselect(
             "Source",
-            options=sorted(
-                df["source"]
-                .dropna()
-                .unique()
-            )
+            options=sorted(df["source"].dropna().unique())
         )
 
         filter_payment = st.multiselect(
             "Payment Method",
             options=PAYMENT_METHODS,
-            format_func=lambda x:
-                "📱 UPI" if x == "UPI" else "💵 Cash"
+            format_func=payment_format
         )
 
-    keyword = st.text_input(
-        "Search notes/category"
-    )
+    keyword = st.text_input("Search notes/category")
 
     filtered_df = df.copy()
 
     if filter_categories:
         filtered_df = filtered_df[
-            filtered_df["category"].isin(
-                filter_categories
-            )
+            filtered_df["category"].isin(filter_categories)
         ]
 
     if filter_type:
-        filtered_df = filtered_df[
-            filtered_df["type"].isin(
-                filter_type
-            )
-        ]
+        filtered_df = filtered_df[filtered_df["type"].isin(filter_type)]
 
     if filter_source:
-        filtered_df = filtered_df[
-            filtered_df["source"].isin(
-                filter_source
-            )
-        ]
+        filtered_df = filtered_df[filtered_df["source"].isin(filter_source)]
 
     if filter_payment:
         filtered_df = filtered_df[
-            filtered_df["payment_method"].isin(
-                filter_payment
-            )
+            filtered_df["payment_method"].isin(filter_payment)
         ]
 
-    if keyword:
-        kw = keyword.strip()
-
-        if kw:
-            filtered_df = filtered_df[
-                filtered_df["note"]
-                .fillna("")
-                .astype(str)
-                .str.contains(
-                    kw,
-                    case=False,
-                    regex=False,
-                    na=False
-                )
-                |
-                filtered_df["category"]
-                .fillna("")
-                .astype(str)
-                .str.contains(
-                    kw,
-                    case=False,
-                    regex=False,
-                    na=False
-                )
-            ]
+    kw = keyword.strip()
+    if kw:
+        filtered_df = filtered_df[
+            filtered_df["note"]
+            .fillna("")
+            .astype(str)
+            .str.contains(kw, case=False, regex=False, na=False)
+            |
+            filtered_df["category"]
+            .fillna("")
+            .astype(str)
+            .str.contains(kw, case=False, regex=False, na=False)
+        ]
 
 
     # ---------------- Export ----------------
@@ -971,185 +885,53 @@ else:
             .encode("utf-8")
         )
 
+        # on_click="ignore": downloading doesn't re-run the whole app.
         st.download_button(
             "Download CSV",
             csv_data,
             file_name=f"transactions_{selected_month}.csv",
             mime="text/csv",
-            use_container_width=True
+            width="stretch",
+            on_click="ignore"
         )
 
     with exp_col2:
-        def pdf_safe(value):
-            """
-            FPDF's built-in Helvetica uses Latin-1.
-            Replace unsupported Unicode characters instead of
-            allowing PDF generation to crash.
-            """
-            return str(value).encode(
-                "latin-1",
-                errors="replace"
-            ).decode("latin-1")
-
-        def generate_pdf(export_df, month, username):
-            pdf = FPDF(
-                orientation="L",
-                unit="mm",
-                format="A4"
+        # Building a PDF is slow, and it used to be rebuilt on EVERY click
+        # even if nobody downloaded it. Now it is built only on request.
+        pdf_signature = (
+            selected_month,
+            int(
+                pd.util.hash_pandas_object(
+                    filtered_df.astype(str), index=False
+                ).sum()
             )
+        )
 
-            pdf.set_auto_page_break(
-                auto=True,
-                margin=12
-            )
-            pdf.add_page()
-
-            pdf.set_font(
-                "Helvetica",
-                "B",
-                16
-            )
-            pdf.cell(
-                0,
-                10,
-                pdf_safe(
-                    f"Pocket Money Report - {month}"
-                ),
-                ln=True
-            )
-
-            pdf.set_font(
-                "Helvetica",
-                "",
-                10
-            )
-            pdf.cell(
-                0,
-                8,
-                pdf_safe(
-                    f"User: {username}"
-                ),
-                ln=True
-            )
-            pdf.ln(4)
-
-            headers = [
-                "Date",
-                "Category",
-                "Amount",
-                "Payment",
-                "Note",
-                "Source"
-            ]
-
-            col_widths = [
-                28, 38, 30, 30, 100, 38
-            ]
-
-            def draw_header():
-                pdf.set_font(
-                    "Helvetica",
-                    "B",
-                    9
-                )
-
-                for width, header in zip(
-                    col_widths,
-                    headers
-                ):
-                    pdf.cell(
-                        width,
-                        8,
-                        header,
-                        border=1
+        if st.button("Prepare PDF report", width="stretch"):
+            try:
+                st.session_state.pdf_report = {
+                    "signature": pdf_signature,
+                    "bytes": generate_pdf(
+                        filtered_df,
+                        selected_month,
+                        st.session_state.username
                     )
+                }
+            except Exception as exc:
+                st.session_state.pop("pdf_report", None)
+                st.error(f"Could not generate PDF: {exc}")
 
-                pdf.ln()
-                pdf.set_font(
-                    "Helvetica",
-                    "",
-                    8
-                )
+        report = st.session_state.get("pdf_report")
 
-            draw_header()
-
-            for _, row in export_df.iterrows():
-                if pdf.get_y() > 185:
-                    pdf.add_page()
-                    draw_header()
-
-                txn_date = row["date"]
-
-                if pd.notna(txn_date):
-                    date_text = (
-                        txn_date.strftime("%Y-%m-%d")
-                        if hasattr(
-                            txn_date,
-                            "strftime"
-                        )
-                        else str(txn_date)
-                    )
-                else:
-                    date_text = "-"
-
-                sign = (
-                    "+"
-                    if row["type"] == "income"
-                    else "-"
-                )
-
-                payment = (
-                    str(
-                        row.get(
-                            "payment_method",
-                            "Cash"
-                        )
-                    )
-                    if row["type"] == "expense"
-                    else "N/A"
-                )
-
-                values = [
-                    date_text,
-                    str(row["category"])[:25],
-                    f"{sign}Rs {float(row['amount']):.2f}",
-                    payment,
-                    str(row["note"] or "")[:60],
-                    str(row["source"] or "-")[:25]
-                ]
-
-                for width, value in zip(
-                    col_widths,
-                    values
-                ):
-                    pdf.cell(
-                        width,
-                        8,
-                        pdf_safe(value),
-                        border=1
-                    )
-
-                pdf.ln()
-
-            return bytes(pdf.output())
-
-        try:
-            pdf_bytes = generate_pdf(
-                filtered_df,
-                selected_month,
-                st.session_state.username
-            )
-
+        # Only offer the file if it still matches what is on screen.
+        if report and report["signature"] == pdf_signature:
             st.download_button(
-                "Download PDF",
-                pdf_bytes,
+                "⬇️ Download PDF",
+                report["bytes"],
                 file_name=f"report_{selected_month}.pdf",
                 mime="application/pdf",
-                use_container_width=True
-            )
-        except Exception as exc:
-            st.error(
-                f"Could not generate PDF: {exc}"
+                width="stretch",
+                on_click="ignore"
             )
 
 
@@ -1160,203 +942,165 @@ else:
     st.subheader("📋 Transactions")
 
     if filtered_df.empty:
-        st.write(
-            "No transactions match your filters."
-        )
+        st.write("No transactions match your filters.")
 
-    for _, row in filtered_df.iterrows():
-        is_editing = (
-            st.session_state.editing_id
-            == row["id"]
-        )
+    limit = st.session_state.get("txn_limit", PAGE_SIZE)
+
+    # Rendering hundreds of rows (each with 3 columns + 2 buttons) is slow,
+    # so only the newest PAGE_SIZE are drawn until "Show more" is pressed.
+    for _, row in filtered_df.head(limit).iterrows():
+        row_id = int(row["id"])
+        is_editing = st.session_state.editing_id == row_id
 
         if is_editing:
-            with st.form(
-                f"edit_form_{row['id']}"
-            ):
-                st.markdown(
-                    f"**Editing transaction #{row['id']}**"
-                )
+            with st.container(border=True):
+                st.markdown(f"**Editing transaction #{row_id}**")
 
+                # Type and Category are outside the form so that choosing
+                # "Other" / "income" immediately updates the fields below.
                 e_type = st.selectbox(
                     "Type",
                     ["expense", "income"],
-                    index=(
-                        0
-                        if row["type"] == "expense"
-                        else 1
-                    ),
-                    key=f"etype_{row['id']}"
+                    index=0 if row["type"] == "expense" else 1,
+                    key=f"etype_{row_id}"
                 )
 
                 # Preserve existing custom categories.
-                existing_category = str(
-                    row["category"] or ""
-                )
+                existing_category = str(row["category"] or "")
 
                 if existing_category in CATEGORIES:
-                    category_index = CATEGORIES.index(
-                        existing_category
-                    )
+                    category_index = CATEGORIES.index(existing_category)
                 else:
-                    category_index = CATEGORIES.index(
-                        "Other"
-                    )
+                    category_index = CATEGORIES.index("Other")
 
                 e_category = st.selectbox(
                     "Category",
                     CATEGORIES,
                     index=category_index,
-                    key=f"ecat_{row['id']}"
+                    key=f"ecat_{row_id}"
                 )
 
-                custom_edit_category = ""
+                with st.form(f"edit_form_{row_id}"):
+                    custom_edit_category = ""
 
-                if e_category == "Other":
-                    custom_edit_category = st.text_input(
-                        "Specify category",
+                    if e_category == "Other":
+                        custom_edit_category = st.text_input(
+                            "Specify category",
+                            value=(
+                                existing_category
+                                if existing_category not in CATEGORIES
+                                else ""
+                            ),
+                            key=f"ecustomcat_{row_id}"
+                        )
+
+                    e_payment_method = None
+
+                    if e_type == "expense":
+                        current_payment = (
+                            row.get("payment_method", "Cash") or "Cash"
+                        )
+
+                        if current_payment not in PAYMENT_METHODS:
+                            current_payment = "Cash"
+
+                        e_payment_method = st.selectbox(
+                            "Payment Method",
+                            PAYMENT_METHODS,
+                            index=PAYMENT_METHODS.index(current_payment),
+                            format_func=payment_format,
+                            key=f"epayment_{row_id}"
+                        )
+
+                    e_amount = st.number_input(
+                        "Amount (₹)",
+                        min_value=0.0,
+                        step=10.0,
+                        value=float(row["amount"]),
+                        key=f"eamt_{row_id}"
+                    )
+
+                    e_note = st.text_input(
+                        "Note",
+                        value=row["note"] or "",
+                        key=f"enote_{row_id}"
+                    )
+
+                    e_date = st.date_input(
+                        "Date",
                         value=(
-                            existing_category
-                            if existing_category not in CATEGORIES
-                            else ""
+                            row["date"].date()
+                            if pd.notna(row["date"])
+                            else date.today()
                         ),
-                        key=f"ecustomcat_{row['id']}"
+                        key=f"edate_{row_id}"
                     )
 
-                e_payment_method = None
-
-                if e_type == "expense":
-                    current_payment = (
-                        row.get(
-                            "payment_method",
-                            "Cash"
+                    e_source = (
+                        st.selectbox(
+                            "Source",
+                            source_names,
+                            index=(
+                                source_names.index(row["source"])
+                                if row["source"] in source_names
+                                else 0
+                            ),
+                            key=f"esrc_{row_id}"
                         )
-                        or "Cash"
+                        if e_type == "expense"
+                        else None
                     )
 
-                    if current_payment not in PAYMENT_METHODS:
-                        current_payment = "Cash"
+                    col_save, col_cancel = st.columns(2)
 
-                    e_payment_method = st.selectbox(
-                        "Payment Method",
-                        PAYMENT_METHODS,
-                        index=PAYMENT_METHODS.index(
-                            current_payment
-                        ),
-                        format_func=lambda x:
-                            "📱 UPI"
-                            if x == "UPI"
-                            else "💵 Cash",
-                        key=f"epayment_{row['id']}"
-                    )
-
-                e_amount = st.number_input(
-                    "Amount (₹)",
-                    min_value=0.0,
-                    step=10.0,
-                    value=float(row["amount"]),
-                    key=f"eamt_{row['id']}"
-                )
-
-                e_note = st.text_input(
-                    "Note",
-                    value=row["note"] or "",
-                    key=f"enote_{row['id']}"
-                )
-
-                e_date = st.date_input(
-                    "Date",
-                    value=(
-                        row["date"].date()
-                        if pd.notna(row["date"])
-                        else date.today()
-                    ),
-                    key=f"edate_{row['id']}"
-                )
-
-                e_source = (
-                    st.selectbox(
-                        "Source",
-                        source_names,
-                        index=(
-                            source_names.index(
-                                row["source"]
-                            )
-                            if row["source"]
-                            in source_names
-                            else 0
-                        ),
-                        key=f"esrc_{row['id']}"
-                    )
-                    if e_type == "expense"
-                    else None
-                )
-
-                col_save, col_cancel = st.columns(2)
-
-                if col_save.form_submit_button(
-                    "💾 Save",
-                    use_container_width=True
-                ):
-                    final_category = (
-                        custom_edit_category.strip()
-                        if e_category == "Other"
-                        else e_category
-                    )
-
-                    if not final_category:
-                        st.error(
-                            "Please specify a category."
+                    if col_save.form_submit_button(
+                        "💾 Save",
+                        width="stretch"
+                    ):
+                        final_category = (
+                            custom_edit_category.strip()
+                            if e_category == "Other"
+                            else e_category
                         )
-                    elif e_amount <= 0:
-                        st.error(
-                            "Amount must be greater than zero."
-                        )
-                    else:
-                        try:
-                            database.update_transaction(
-                                user_id,
-                                row["id"],
-                                e_type,
-                                final_category,
-                                e_amount,
-                                e_note,
-                                str(e_date),
-                                e_source,
-                                e_payment_method
-                            )
 
-                            st.session_state.editing_id = None
-                            st.rerun()
+                        if not final_category:
+                            st.error("Please specify a category.")
+                        elif e_amount <= 0:
+                            st.error("Amount must be greater than zero.")
+                        else:
+                            try:
+                                database.update_transaction(
+                                    user_id,
+                                    row_id,
+                                    e_type,
+                                    final_category,
+                                    e_amount,
+                                    e_note,
+                                    str(e_date),
+                                    e_source,
+                                    e_payment_method
+                                )
 
-                        except ValueError as exc:
-                            st.error(str(exc))
+                                st.session_state.editing_id = None
+                                st.rerun()
 
-                if col_cancel.form_submit_button(
-                    "Cancel",
-                    use_container_width=True
-                ):
-                    st.session_state.editing_id = None
-                    st.rerun()
+                            except ValueError as exc:
+                                st.error(str(exc))
+
+                    if col_cancel.form_submit_button(
+                        "Cancel",
+                        width="stretch"
+                    ):
+                        st.session_state.editing_id = None
+                        st.rerun()
 
         else:
             with st.container(border=True):
-                col1, col2, col3 = st.columns(
-                    [4, 1, 1]
-                )
+                col1, col2, col3 = st.columns([4, 1, 1])
 
                 with col1:
-                    sign = (
-                        "+"
-                        if row["type"] == "income"
-                        else "-"
-                    )
-
-                    color = (
-                        "green"
-                        if row["type"] == "income"
-                        else "red"
-                    )
+                    sign = "+" if row["type"] == "income" else "-"
+                    color = "green" if row["type"] == "income" else "red"
 
                     source_label = (
                         f" · from {row['source']}"
@@ -1365,18 +1109,8 @@ else:
                     )
 
                     if row["type"] == "expense":
-                        pm = (
-                            row.get(
-                                "payment_method",
-                                "Cash"
-                            )
-                            or "Cash"
-                        )
-
-                        payment_label = (
-                            "📱 UPI"
-                            if pm == "UPI"
-                            else "💵 Cash"
+                        payment_label = payment_format(
+                            row.get("payment_method", "Cash") or "Cash"
                         )
                     else:
                         payment_label = ""
@@ -1389,29 +1123,28 @@ else:
                     )
 
                     st.markdown(
-                        f":{color}[{sign}"
-                        f"₹{row['amount']:,.0f}]  \n"
+                        f":{color}[{sign}{inr(row['amount'])}]  \n"
                         f"{row['note'] or ''}"
                     )
 
                 with col2:
-                    if st.button(
-                        "✏️",
-                        key=f"edit_{row['id']}"
-                    ):
-                        st.session_state.editing_id = row["id"]
+                    if st.button("✏️", key=f"edit_{row_id}"):
+                        st.session_state.editing_id = row_id
                         st.rerun()
 
                 with col3:
-                    if st.button(
-                        "🗑️",
-                        key=f"del_{row['id']}"
-                    ):
+                    if st.button("🗑️", key=f"del_{row_id}"):
                         try:
-                            database.delete_transaction(
-                                user_id,
-                                row["id"]
-                            )
+                            database.delete_transaction(user_id, row_id)
                             st.rerun()
                         except ValueError as exc:
                             st.error(str(exc))
+
+    remaining_rows = len(filtered_df) - limit
+    if remaining_rows > 0:
+        if st.button(
+            f"Show more ({remaining_rows} more)",
+            width="stretch"
+        ):
+            st.session_state.txn_limit = limit + PAGE_SIZE
+            st.rerun()
