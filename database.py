@@ -613,7 +613,7 @@ def add_to_source_amount(user_id, month, source, amount):
 
 
 def delete_source(user_id, month, source):
-    """Remove a source. Refused if expenses were already made from it."""
+    """Remove a source. Refused if transactions (expenses or income) use it."""
     def work(conn):
         with conn.cursor() as cur:
             cur.execute(
@@ -621,7 +621,6 @@ def delete_source(user_id, month, source):
                 SELECT COUNT(*)
                 FROM transactions
                 WHERE user_id = %s
-                  AND type = 'expense'
                   AND source = %s
                   AND date LIKE %s
                 """,
@@ -629,8 +628,8 @@ def delete_source(user_id, month, source):
             )
             if cur.fetchone()[0] > 0:
                 raise ValueError(
-                    f"{source} has expenses this month, so it can't be "
-                    "removed. Edit or delete those expenses first."
+                    f"{source} has transactions this month, so it can't be "
+                    "removed. Edit or delete those transactions first."
                 )
 
             cur.execute(

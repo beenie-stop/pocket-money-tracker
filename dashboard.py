@@ -387,6 +387,20 @@ if not df_all.empty:
             .to_dict()
         )
 
+# Income that was added "to" a specific source (see "Add money to").
+income_by_source = {}
+
+if not df_all.empty:
+    income_df_all = df_all[df_all["type"] == "income"]
+
+    if not income_df_all.empty:
+        income_by_source = (
+            income_df_all
+            .groupby("source")["amount"]
+            .sum()
+            .to_dict()
+        )
+
 if sources:
     st.write("**Balance by source:**")
 
@@ -395,15 +409,19 @@ if sources:
     overspent = []
 
     for i, source_row in enumerate(sources):
-        remaining = (
+        received_total = (
             source_row["amount"]
+            + income_by_source.get(source_row["source"], 0)
+        )
+        remaining = (
+            received_total
             - spent_by_source.get(source_row["source"], 0)
         )
 
         cols[i % len(cols)].metric(
             source_row["source"],
             inr(remaining),
-            help=f"of {inr(source_row['amount'])} received"
+            help=f"of {inr(received_total)} received"
         )
 
         if remaining < 0:
@@ -441,10 +459,10 @@ t_type = st.selectbox("Type", ["expense", "income"], key="add_type")
 category = st.selectbox("Category", CATEGORIES, key="add_category")
 
 with st.form("add_form", clear_on_submit=True):
-    spend_source = (
-        st.selectbox("Spend from", source_names)
-        if t_type == "expense"
-        else None
+    # Expenses are spent FROM a source; income is added TO a source.
+    spend_source = st.selectbox(
+        "Spend from" if t_type == "expense" else "Add money to",
+        source_names
     )
 
     custom_category = (
@@ -708,13 +726,20 @@ else:
         source_budget_map = {s["source"]: s["amount"] for s in sources}
 
         all_source_names = sorted(
-            set(list(source_budget_map.keys()) + list(src_spent.keys()))
+            set(
+                list(source_budget_map.keys())
+                + list(src_spent.keys())
+                + list(income_by_source.keys())
+            )
         )
 
         src_rows = []
 
         for source_name in all_source_names:
-            received = source_budget_map.get(source_name, 0)
+            received = (
+                source_budget_map.get(source_name, 0)
+                + income_by_source.get(source_name, 0)
+            )
             spent_amt = src_spent.get(source_name, 0)
             left = received - spent_amt
 
@@ -1036,19 +1061,26 @@ else:
                         key=f"edate_{row_id}"
                     )
 
-                    e_source = (
-                        st.selectbox(
-                            "Source",
-                            source_names,
-                            index=(
-                                source_names.index(row["source"])
-                                if row["source"] in source_names
-                                else 0
-                            ),
-                            key=f"esrc_{row_id}"
-                        )
+                    # Expense: spent FROM a source. Income: added TO a source
+                    # (old income rows may have none, so allow "— none —").
+                    src_options = (
+                        source_names
                         if e_type == "expense"
-                        else None
+                        else [None] + source_names
+                    )
+                    if row["source"] in source_names:
+                        current_src = row["source"]
+                    else:
+                        current_src = (
+                            source_names[0] if e_type == "expense" else None
+                        )
+
+                    e_source = st.selectbox(
+                        "Spend from" if e_type == "expense" else "Add money to",
+                        src_options,
+                        index=src_options.index(current_src),
+                        format_func=lambda s: "— none —" if s is None else s,
+                        key=f"esrc_{row_id}_{e_type}"
                     )
 
                     col_save, col_cancel = st.columns(2)
@@ -1103,7 +1135,8 @@ else:
                     color = "green" if row["type"] == "income" else "red"
 
                     source_label = (
-                        f" · from {row['source']}"
+                        f" · {'to' if row['type'] == 'income' else 'from'} "
+                        f"{row['source']}"
                         if row.get("source")
                         else ""
                     )
