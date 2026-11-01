@@ -66,6 +66,11 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# Category used for leftover money carried into a new month (see the
+# "Start new month" card). History treats it separately so leftovers are not
+# counted as new income twice.
+CARRY_OVER_CATEGORY = "Carry-over"
+
 # Largest value that fits in NUMERIC(12, 2).
 _MAX_MONEY = Decimal("9999999999.99")
 
@@ -356,6 +361,7 @@ def _invalidate_cache():
     get_available_months.clear()
     get_sources_by_month.clear()
     get_transactions_by_month.clear()
+    get_monthly_summary.clear()
 
 
 # ---------- Transactions ----------
@@ -423,6 +429,49 @@ def add_transaction(
 
     _run(work, write=True)
     _invalidate_cache()
+
+
+def add_transactions(user_id, rows):
+    """Add many transactions in ONE database round trip.
+
+    ``rows`` is a list of dicts with keys: type, category, amount, and
+    optionally note, date, source, payment_method. Either all rows are saved
+    or (if one is invalid) none are.
+    """
+    cleaned = []
+    for r in rows:
+        t_type, category, amount, txn_date = _clean_transaction_fields(
+            r.get("type"), r.get("category"), r.get("amount"), r.get("date")
+        )
+        cleaned.append((
+            user_id,
+            t_type,
+            category,
+            amount,
+            r.get("note") or "",
+            txn_date,
+            r.get("source"),
+            _normalize_payment_method(t_type, r.get("payment_method"))
+        ))
+
+    if not cleaned:
+        return 0
+
+    def work(conn):
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO transactions
+                (user_id, type, category, amount, note, date, source, payment_method)
+                VALUES %s
+                """,
+                cleaned
+            )
+
+    _run(work, write=True)
+    _invalidate_cache()
+    return len(cleaned)
 
 
 def update_transaction(
@@ -517,6 +566,53 @@ def get_available_months(user_id):
                 (user_id, user_id)
             )
             return [r[0] for r in cur.fetchall()]
+
+    return _run(work)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_monthly_summary(user_id):
+    """One row per month (newest first) for the History view.
+
+    received = money received from sources, income = other income,
+    carried = leftovers carried in from the previous month, spent = expenses.
+    """
+    def work(conn):
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(t.month, s.month) AS month,
+                       COALESCE(s.received, 0) AS received,
+                       COALESCE(t.income, 0)   AS income,
+                       COALESCE(t.carried, 0)  AS carried,
+                       COALESCE(t.spent, 0)    AS spent
+                FROM (
+                    SELECT LEFT(date, 7) AS month,
+                           SUM(CASE WHEN type = 'expense'
+                                    THEN amount ELSE 0 END) AS spent,
+                           SUM(CASE WHEN type = 'income' AND category <> %s
+                                    THEN amount ELSE 0 END) AS income,
+                           SUM(CASE WHEN type = 'income' AND category = %s
+                                    THEN amount ELSE 0 END) AS carried
+                    FROM transactions
+                    WHERE user_id = %s
+                    GROUP BY LEFT(date, 7)
+                ) AS t
+                FULL OUTER JOIN (
+                    SELECT month, SUM(amount) AS received
+                    FROM money_sources
+                    WHERE user_id = %s
+                    GROUP BY month
+                ) AS s ON t.month = s.month
+                WHERE COALESCE(t.month, s.month) IS NOT NULL
+                  AND COALESCE(t.month, s.month) <> ''
+                ORDER BY 1 DESC
+                """,
+                (CARRY_OVER_CATEGORY, CARRY_OVER_CATEGORY, user_id, user_id)
+            )
+            return [dict(row) for row in cur.fetchall()]
 
     return _run(work)
 
